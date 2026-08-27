@@ -1,0 +1,616 @@
+import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.49.1";
+import { SMTPClient } from "../_shared/smtp-client.ts";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
+};
+
+interface NotificationRequest {
+  batch_id: string;
+  item_type: "RECORDING" | "LIVE_SESSION" | "ASSIGNMENT";
+  item_id: string;
+  title: string;
+  description?: string;
+  meeting_link?: string;
+  start_datetime?: string;
+  timeline_item_id?: string;
+  mentor_name?: string;
+  mentor_id?: string;
+  cta_path?: string;
+  is_reminder?: boolean;
+  is_recording_update?: boolean;
+  is_update?: boolean;
+  reminder_label?: string;
+  include_mentor?: boolean;
+  /**
+   * When true, the function accepts the job, returns 202 immediately, and
+   * finishes sending in the background via EdgeRuntime.waitUntil. This is what
+   * the admin UI uses so bulk sends do not block the dialog.
+   */
+  async?: boolean;
+  /**
+   * When true, target students who are NOT in any batch but are enrolled in
+   * `course_id`. In this mode `batch_id` is a sentinel (e.g. "unbatched") and
+   * is not used to look up a real batch.
+   */
+  unbatched?: boolean;
+  course_id?: string;
+}
+
+// Deno Deploy's background-work API. Typed loosely so this file still compiles
+// under a plain TypeScript checker.
+declare const EdgeRuntime: { waitUntil: (p: Promise<unknown>) => void } | undefined;
+
+const PKT_OFFSET_MS = 5 * 60 * 60 * 1000;
+
+const parseSessionDate = (timestamp: string): Date => {
+  if (/[zZ]|[+-]\d{2}:?\d{2}$/.test(timestamp)) {
+    return new Date(timestamp);
+  }
+
+  const [datePart, timePart = "00:00:00"] = timestamp.replace(" ", "T").split("T");
+  const [year, month, day] = datePart.split("-").map(Number);
+  const [hour = 0, minute = 0, second = 0] = timePart.split(":").map(Number);
+
+  return new Date(Date.UTC(year, month - 1, day, hour, minute, second) - PKT_OFFSET_MS);
+};
+
+interface Student {
+  id: string;
+  email: string;
+  full_name: string;
+}
+
+function generateEmailHTML(
+  studentName: string,
+  itemType: string,
+  title: string,
+  description: string | undefined,
+  meetingLink: string | undefined,
+  startDatetime: string | undefined,
+  lmsUrl: string,
+  companyName: string,
+  mentorName?: string,
+  ctaPath?: string,
+  isReminder?: boolean,
+  isRecordingUpdate?: boolean,
+  isUpdate?: boolean,
+  reminderLabel?: string,
+): string {
+  const firstName = studentName?.split(" ")[0] || "Student";
+  const ctaUrl = ctaPath ? `${lmsUrl.replace(/\/$/, '')}${ctaPath.startsWith('/') ? ctaPath : '/' + ctaPath}` : lmsUrl;
+
+  if (itemType === "RECORDING") {
+    return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>New Recording Available</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
+  <div style="max-width: 600px; margin: 0 auto; padding: 40px 20px;">
+    <div style="background-color: #ffffff; border-radius: 12px; padding: 40px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+      <div style="text-align: center; margin-bottom: 30px;">
+        <div style="width: 60px; height: 60px; background-color: #10b981; border-radius: 50%; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center;">
+          <span style="font-size: 28px;">🎬</span>
+        </div>
+        <h1 style="color: #1f2937; font-size: 24px; margin: 0;">New Recording Available!</h1>
+      </div>
+      
+      <p style="color: #4b5563; font-size: 16px; line-height: 1.6; margin-bottom: 20px;">
+        Hi ${firstName},
+      </p>
+      
+      <p style="color: #4b5563; font-size: 16px; line-height: 1.6; margin-bottom: 20px;">
+        A new recording is now available in your course!
+      </p>
+      
+      <div style="background-color: #f0fdf4; border-left: 4px solid #10b981; padding: 20px; margin: 25px 0; border-radius: 0 8px 8px 0;">
+        <h2 style="color: #166534; font-size: 18px; margin: 0 0 10px 0;">📹 ${title}</h2>
+        ${description ? `<p style="color: #4b5563; font-size: 14px; margin: 0;">${description}</p>` : ""}
+      </div>
+      
+      <p style="color: #4b5563; font-size: 16px; line-height: 1.6; margin-bottom: 25px;">
+        Login to start watching now.
+      </p>
+      
+      <div style="text-align: center;">
+        <a href="${lmsUrl}" style="display: inline-block; background-color: #10b981; color: #ffffff; padding: 14px 32px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 16px;">
+          Start Learning
+        </a>
+      </div>
+      
+      <p style="color: #9ca3af; font-size: 12px; text-align: center; margin-top: 40px;">
+        ${companyName} • Keep up the great work! 🚀
+      </p>
+    </div>
+  </div>
+</body>
+</html>`;
+  }
+
+  if (itemType === "LIVE_SESSION") {
+    const formattedDate = startDatetime
+      ? parseSessionDate(startDatetime).toLocaleString("en-US", {
+          weekday: "long",
+          year: "numeric",
+          month: "long",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+          timeZone: "Asia/Karachi",
+          timeZoneName: "short",
+        })
+      : "To be announced";
+
+    const headline = isRecordingUpdate
+      ? "Session Recording Available"
+      : isUpdate ? "Live Session Updated"
+      : isReminder ? (reminderLabel || "Starting Soon") : "You're Invited to a Live Session";
+    const eyebrow = isRecordingUpdate ? "Recording" : isUpdate ? "Update" : (isReminder ? "Reminder" : "Live Session");
+    const intro = isRecordingUpdate
+      ? "The live session has ended. The recording is now available — catch up at your convenience."
+      : isUpdate
+        ? "Heads up — the details for an upcoming live session have been updated. Please review the latest schedule below."
+        : isReminder
+          ? "Your live session starts soon. Here are the details so you can join on time."
+          : "A new live session has been scheduled for your batch. Here's everything you need to know.";
+    const closing = isRecordingUpdate
+      ? "Click below to watch the recording."
+      : isUpdate
+        ? "Please update your calendar with the new details."
+        : isReminder
+          ? "Tip: log in a few minutes early to settle in before it begins."
+          : "Add it to your calendar so you don't miss it.";
+    const ctaLabel = isRecordingUpdate ? "Watch Recording" : "View Live Sessions";
+
+    return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${headline}</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f4f4f7; color: #1f2937;">
+  <div style="max-width: 560px; margin: 0 auto; padding: 32px 16px;">
+    <div style="background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 8px 24px rgba(15,23,42,0.06); border: 1px solid #eef0f4;">
+      <div style="background: linear-gradient(135deg, #6d28d9 0%, #8b5cf6 100%); padding: 32px;">
+        <p style="color: rgba(255,255,255,0.85); font-size: 12px; font-weight: 600; letter-spacing: 1.5px; text-transform: uppercase; margin: 0 0 8px;">${eyebrow}</p>
+        <h1 style="color: #ffffff; font-size: 24px; line-height: 1.3; margin: 0; font-weight: 700;">${headline}</h1>
+      </div>
+
+      <div style="padding: 32px;">
+        <p style="color: #111827; font-size: 16px; line-height: 1.6; margin: 0 0 12px;">Hi ${firstName},</p>
+        <p style="color: #4b5563; font-size: 15px; line-height: 1.65; margin: 0 0 24px;">${intro}</p>
+
+        <div style="border: 1px solid #ececf3; border-radius: 12px; padding: 20px 22px; margin-bottom: 24px; background-color: #fafafe;">
+          <p style="color: #111827; font-size: 17px; font-weight: 600; margin: 0 0 16px; line-height: 1.4;">${title}</p>
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="width: 100%; font-size: 14px; color: #374151;">
+            <tr>
+              <td style="padding: 6px 0; color: #6b7280; width: 90px; vertical-align: top;">${isRecordingUpdate ? "Held on" : "Date"}</td>
+              <td style="padding: 6px 0; color: #111827; font-weight: 500;">${formattedDate}</td>
+            </tr>
+            ${mentorName ? `<tr><td style="padding: 6px 0; color: #6b7280; vertical-align: top;">Mentor</td><td style="padding: 6px 0; color: #111827; font-weight: 500;">${mentorName}</td></tr>` : ""}
+            ${description ? `<tr><td style="padding: 6px 0; color: #6b7280; vertical-align: top;">Details</td><td style="padding: 6px 0; color: #4b5563;">${description}</td></tr>` : ""}
+          </table>
+        </div>
+
+        <div style="text-align: center; margin: 28px 0 12px;">
+          <a href="${ctaUrl}" style="display: inline-block; background-color: #6d28d9; color: #ffffff; padding: 13px 28px; border-radius: 10px; text-decoration: none; font-weight: 600; font-size: 15px;">
+            ${ctaLabel}
+          </a>
+        </div>
+
+        <p style="color: #6b7280; font-size: 13px; line-height: 1.6; margin: 16px 0 0; text-align: center;">${closing}</p>
+      </div>
+
+      <div style="padding: 18px 32px; border-top: 1px solid #f1f1f5; background-color: #fafafc; text-align: center;">
+        <p style="color: #9ca3af; font-size: 12px; margin: 0;">${companyName}</p>
+      </div>
+    </div>
+  </div>
+</body>
+</html>`;
+  }
+
+  // ASSIGNMENT
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>New Assignment Available</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f5f5f5;">
+  <div style="max-width: 600px; margin: 0 auto; padding: 40px 20px;">
+    <div style="background-color: #ffffff; border-radius: 12px; padding: 40px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+      <div style="text-align: center; margin-bottom: 30px;">
+        <div style="width: 60px; height: 60px; background-color: #f59e0b; border-radius: 50%; margin: 0 auto 20px; display: flex; align-items: center; justify-content: center;">
+          <span style="font-size: 28px;">📝</span>
+        </div>
+        <h1 style="color: #1f2937; font-size: 24px; margin: 0;">New Assignment Available!</h1>
+      </div>
+      
+      <p style="color: #4b5563; font-size: 16px; line-height: 1.6; margin-bottom: 20px;">
+        Hi ${firstName},
+      </p>
+      
+      <p style="color: #4b5563; font-size: 16px; line-height: 1.6; margin-bottom: 20px;">
+        A new assignment has been unlocked for you!
+      </p>
+      
+      <div style="background-color: #fffbeb; border-left: 4px solid #f59e0b; padding: 20px; margin: 25px 0; border-radius: 0 8px 8px 0;">
+        <h2 style="color: #b45309; font-size: 18px; margin: 0 0 10px 0;">✍️ ${title}</h2>
+        ${description ? `<p style="color: #4b5563; font-size: 14px; margin: 0;">${description}</p>` : ""}
+      </div>
+      
+      <p style="color: #4b5563; font-size: 16px; line-height: 1.6; margin-bottom: 25px;">
+        Complete this before the next recording unlocks.
+      </p>
+      
+      <div style="text-align: center;">
+        <a href="${lmsUrl}" style="display: inline-block; background-color: #f59e0b; color: #ffffff; padding: 14px 32px; border-radius: 8px; text-decoration: none; font-weight: 600; font-size: 16px;">
+          View Assignment
+        </a>
+      </div>
+      
+      <p style="color: #9ca3af; font-size: 12px; text-align: center; margin-top: 40px;">
+        ${companyName} • You've got this! 💪
+      </p>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+function getEmailSubject(itemType: string, title: string, isReminder?: boolean, isRecordingUpdate?: boolean, isUpdate?: boolean, reminderLabel?: string): string {
+  switch (itemType) {
+    case "RECORDING":
+      return `New Recording Available: ${title}`;
+    case "LIVE_SESSION":
+      if (isRecordingUpdate) return `Recording Available: ${title}`;
+      if (isUpdate) return `Live Session Updated: ${title}`;
+      return isReminder ? `Reminder: ${title} — ${reminderLabel || "starting soon"}` : `Live Session Scheduled: ${title}`;
+    case "ASSIGNMENT":
+      return `New Assignment Available: ${title}`;
+    default:
+      return `New Content Available: ${title}`;
+  }
+}
+
+const handler = async (req: Request): Promise<Response> => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const supabaseServiceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const notificationCcSecret = Deno.env.get("NOTIFICATION_EMAIL_CC");
+
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
+
+    // Fetch company settings for sender branding and LMS links.
+    const { data: companySettings, error: companySettingsError } = await supabase
+      .from('company_settings')
+      .select('company_name, lms_url')
+      .limit(1)
+      .maybeSingle();
+    if (companySettingsError) {
+      console.error('[send-batch-content-notification] Failed to load company_settings:', companySettingsError);
+    }
+    const companyName = companySettings?.company_name || 'IDMPakistan';
+    const lmsUrl = companySettings?.lms_url || Deno.env.get("LMS_URL") || "https://growthos.idmpakistan.pk";
+    const notificationCc = notificationCcSecret;
+
+    const body: NotificationRequest = await req.json();
+    const {
+      batch_id,
+      item_type,
+      item_id,
+      title,
+      description,
+      meeting_link,
+      start_datetime,
+      timeline_item_id,
+      mentor_name,
+      mentor_id,
+      cta_path,
+      is_reminder,
+      is_recording_update,
+      is_update,
+      reminder_label,
+      include_mentor,
+      unbatched,
+      course_id,
+    } = body;
+
+    // Validate required fields
+    if (!item_type || !item_id || !title) {
+      return new Response(
+        JSON.stringify({ error: "Missing required fields: item_type, item_id, title" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+    if (unbatched === true) {
+      if (!course_id) {
+        return new Response(
+          JSON.stringify({ error: "unbatched mode requires course_id" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+    } else if (!batch_id) {
+      return new Response(
+        JSON.stringify({ error: "Missing required field: batch_id" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Fire-and-forget mode: the admin UI passes { async: true } for bulk sends
+    // so the dialog can close instantly while emails go out in the background.
+    // We re-invoke ourselves without the async flag; the outer request returns 202.
+    if (body.async === true) {
+      const forwardBody = { ...body, async: false };
+      const authHeader = req.headers.get("Authorization") ?? "";
+      const apiKeyHeader = req.headers.get("apikey") ?? "";
+      const subInvocation = fetch(req.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(authHeader ? { Authorization: authHeader } : {}),
+          ...(apiKeyHeader ? { apikey: apiKeyHeader } : {}),
+        },
+        body: JSON.stringify(forwardBody),
+      }).catch((err) => {
+        console.error("[send-batch-content-notification] async self-invoke failed:", err);
+      });
+      if (typeof EdgeRuntime !== "undefined") {
+        try {
+          EdgeRuntime.waitUntil(subInvocation);
+        } catch (_) {
+          // Older runtimes without waitUntil — fetch is already dispatched.
+        }
+      }
+      return new Response(
+        JSON.stringify({ accepted: true, mode: "async" }),
+        { status: 202, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    console.log(
+      unbatched
+        ? `Processing UNBATCHED notification for course ${course_id}, type: ${item_type}, title: ${title}`
+        : `Processing notification for batch ${batch_id}, type: ${item_type}, title: ${title}`
+    );
+
+    // Build the list of enrolled student ids for either mode.
+    let enrollmentQuery = supabase
+      .from("course_enrollments")
+      .select("student_id, batch_id")
+      .eq("status", "active");
+
+    if (unbatched === true) {
+      enrollmentQuery = enrollmentQuery.eq("course_id", course_id!).is("batch_id", null);
+    } else {
+      enrollmentQuery = enrollmentQuery.eq("batch_id", batch_id);
+    }
+
+    const { data: enrollments, error: enrollmentError } = await enrollmentQuery;
+
+    if (enrollmentError) {
+      console.error("Error fetching enrollments:", enrollmentError);
+      return new Response(
+        JSON.stringify({ error: "Failed to fetch enrolled students" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    let studentIds = Array.from(new Set((enrollments || []).map((e: any) => e.student_id).filter(Boolean)));
+    let userIds: string[] = [];
+
+    // For unbatched mode: also confirm the student has no batch on the students table
+    if (unbatched === true && studentIds.length > 0) {
+      const { data: studentRows, error: studentsError } = await supabase
+        .from("students")
+        .select("id, user_id, batch_id")
+        .in("id", studentIds);
+
+      if (studentsError) {
+        console.error("Error fetching students for unbatched:", studentsError);
+        return new Response(
+          JSON.stringify({ error: "Failed to fetch enrolled students" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      const unbatchedRows = (studentRows || []).filter((s: any) => !s.batch_id);
+      userIds = Array.from(new Set(unbatchedRows.map((s: any) => s.user_id).filter(Boolean)));
+    } else if (studentIds.length > 0) {
+      const { data: studentRows, error: studentsError } = await supabase
+        .from("students")
+        .select("id, user_id")
+        .in("id", studentIds);
+
+      if (studentsError) {
+        console.error("Error fetching student user IDs:", studentsError);
+        return new Response(
+          JSON.stringify({ error: "Failed to fetch enrolled students" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+
+      userIds = Array.from(new Set((studentRows || []).map((student: any) => student.user_id).filter(Boolean)));
+    }
+
+    let usersById = new Map<string, { id: string; email: string; full_name: string }>();
+    if (userIds.length > 0) {
+      const { data: usersData, error: usersError } = await supabase
+        .from("users")
+        .select("id, email, full_name")
+        .in("id", userIds);
+      if (usersError) {
+        console.error("Error fetching users:", usersError);
+        return new Response(
+          JSON.stringify({ error: "Failed to fetch enrolled students" }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
+      usersById = new Map((usersData || []).map((u: any) => [u.id, u]));
+    }
+
+    if (!enrollments || enrollments.length === 0) {
+      console.log(unbatched ? "No unbatched students for this course" : "No students enrolled in this batch");
+      return new Response(
+        JSON.stringify({ message: "No matching students", sent: 0, failed: 0 }),
+        { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+
+    // Extract unique students
+    const students: Student[] = Array.from(usersById.values())
+      .filter((u) => !!u.email)
+      .map((u) => ({
+        id: u.id,
+        email: u.email,
+        full_name: u.full_name || "Student",
+      }));
+
+    // Include assigned mentor as recipient for LIVE_SESSION scheduled/reminder emails
+    // (skip recording-availability updates which are student-only)
+    if (
+      item_type === "LIVE_SESSION" &&
+      !is_recording_update &&
+      include_mentor === true &&
+      mentor_id &&
+      !students.some((s) => s.id === mentor_id)
+    ) {
+      const { data: mentorUser, error: mentorError } = await supabase
+        .from("users")
+        .select("id, email, full_name")
+        .eq("id", mentor_id)
+        .maybeSingle();
+      if (mentorError) {
+        console.error("Failed to fetch mentor user:", mentorError);
+      } else if (mentorUser?.email) {
+        students.push({
+          id: mentorUser.id,
+          email: mentorUser.email,
+          full_name: mentorUser.full_name || mentor_name || "Mentor",
+        });
+      }
+    }
+
+    console.log(`Sending notifications to ${students.length} recipients`);
+
+    // Initialize SMTP client
+    let smtpClient: SMTPClient | null = null;
+    try {
+      smtpClient = SMTPClient.fromEnv();
+      smtpClient.setFromName(companyName);
+    } catch (error) {
+      console.error("SMTP not configured, will queue emails:", error);
+    }
+
+    let sentCount = 0;
+    let failedCount = 0;
+    const errors: string[] = [];
+
+    for (const student of students) {
+      try {
+        const emailHtml = generateEmailHTML(
+          student.full_name,
+          item_type,
+          title,
+          description,
+          meeting_link,
+          start_datetime,
+          lmsUrl,
+          companyName,
+          mentor_name,
+          cta_path,
+          is_reminder,
+          is_recording_update,
+          is_update,
+          reminder_label,
+        );
+        const subject = getEmailSubject(item_type, title, is_reminder, is_recording_update, is_update, reminder_label);
+
+        if (smtpClient) {
+          // Send directly via SMTP
+          await smtpClient.sendEmail({
+            to: student.email,
+            subject,
+            html: emailHtml,
+            cc: notificationCc,
+          });
+          console.log(`Email sent to ${student.email}`);
+        } else {
+          // Queue email for later processing
+          await supabase.from("email_queue").insert({
+            recipient_email: student.email,
+            subject,
+            html_content: emailHtml,
+            cc_email: notificationCc,
+            status: "pending",
+          });
+          console.log(`Email queued for ${student.email}`);
+        }
+
+        // Create in-app notification
+        const actionUrl = cta_path
+          ? `${lmsUrl.replace(/\/$/, '')}${cta_path.startsWith('/') ? cta_path : '/' + cta_path}`
+          : lmsUrl;
+        await supabase.from("notifications").insert({
+          user_id: student.id,
+          title: subject,
+          message: `${title}${description ? `: ${description.substring(0, 100)}...` : ""}`,
+          type: "content",
+          action_url: actionUrl,
+        });
+
+        sentCount++;
+      } catch (error: any) {
+        console.error(`Failed to notify ${student.email}:`, error);
+        errors.push(`${student.email}: ${error.message}`);
+        failedCount++;
+      }
+      // Throttle to stay under provider rate limits (Resend: 2 req/sec)
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    }
+
+    // Update timeline item notification_sent_at if provided
+    if (timeline_item_id) {
+      await supabase
+        .from("batch_timeline_items")
+        .update({ notification_sent_at: new Date().toISOString() })
+        .eq("id", timeline_item_id);
+    }
+
+    console.log(`Notification complete: ${sentCount} sent, ${failedCount} failed`);
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        sent: sentCount,
+        failed: failedCount,
+        errors: errors.length > 0 ? errors : undefined,
+      }),
+      { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  } catch (error: any) {
+    console.error("Error in send-batch-content-notification:", error);
+    return new Response(
+      JSON.stringify({ error: error.message }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+    );
+  }
+};
+
+serve(handler);

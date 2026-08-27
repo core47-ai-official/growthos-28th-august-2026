@@ -1,0 +1,925 @@
+import { useState, useEffect } from 'react';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Badge } from '@/components/ui/badge';
+import { Clock, Save, Loader2, Video, Plus, Check, X, Trash2, GripVertical } from 'lucide-react';
+import { DndContext, closestCenter, PointerSensor, useSensor, useSensors, type DragEndEvent } from '@dnd-kit/core';
+import { SortableContext, arrayMove, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
+import { supabase } from '@/integrations/supabase/client';
+import { useToast } from '@/hooks/use-toast';
+import { logger } from '@/lib/logger';
+import { addDays, format } from 'date-fns';
+
+interface ContentTimelineDialogProps {
+  type: 'course' | 'pathway';
+  entityId: string;
+  entityName: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}
+
+interface RecordingItem {
+  id: string;
+  recording_title: string | null;
+  sequence_order: number | null;
+  duration_min: number | null;
+  drip_days: number | null;
+  module_id: string | null;
+  module_title: string;
+  course_id: string | null;
+  course_title: string;
+  step_number: number | null;
+  has_override: boolean;
+  default_drip_days: number | null;
+}
+
+interface SessionItem {
+  id: string;
+  title: string;
+  schedule_date: string | null;
+  drip_days: number | null;
+  course_id: string | null;
+  course_title: string;
+  step_number: number | null;
+}
+
+export function ContentTimelineDialog({ type, entityId, entityName, open, onOpenChange }: ContentTimelineDialogProps) {
+  const [recordings, setRecordings] = useState<RecordingItem[]>([]);
+  const [sessions, setSessions] = useState<SessionItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [editedDripDays, setEditedDripDays] = useState<Record<string, number | null>>({});
+  const [editedSequenceOrders, setEditedSequenceOrders] = useState<Record<string, number>>({});
+  const [editedSessionDripDays, setEditedSessionDripDays] = useState<Record<string, number | null>>({});
+  const [editedSessionTitles, setEditedSessionTitles] = useState<Record<string, string>>({});
+  const [editingTitleId, setEditingTitleId] = useState<string | null>(null);
+  const [addingSessionForCourse, setAddingSessionForCourse] = useState<string | null>(null);
+  const [newSessionTitle, setNewSessionTitle] = useState('');
+  const [newSessionDripDays, setNewSessionDripDays] = useState<number | null>(null);
+  const [creatingSession, setCreatingSession] = useState(false);
+  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
+  const { toast } = useToast();
+
+  useEffect(() => {
+    if (open && entityId) {
+      fetchAll();
+      setEditedDripDays({});
+      setEditedSequenceOrders({});
+      setEditedSessionDripDays({});
+      setEditedSessionTitles({});
+      setEditingTitleId(null);
+      setAddingSessionForCourse(null);
+      setNewSessionTitle('');
+      setNewSessionDripDays(null);
+    }
+  }, [open, entityId]);
+
+  const fetchAll = async () => {
+    setLoading(true);
+    try {
+      if (type === 'course') {
+        const items = await fetchCourseRecordings(entityId);
+        setRecordings(items || []);
+        await fetchCourseSessions([{ courseId: entityId, courseTitle: entityName, stepNumber: null }]);
+      } else {
+        await fetchPathwayAll(entityId);
+      }
+    } catch (error) {
+      logger.error('Error fetching timeline data:', error);
+      toast({ title: "Error", description: "Failed to load timeline", variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchCourseRecordings = async (courseId: string, courseTitle?: string, stepNumber?: number | null): Promise<RecordingItem[]> => {
+    const { data: modules } = await supabase
+      .from('modules')
+      .select('id, title, order')
+      .eq('course_id', courseId)
+      .order('order', { ascending: true });
+
+    if (!modules?.length) return [];
+
+    const moduleIds = modules.map(m => m.id);
+    const { data: lessons } = await supabase
+      .from('available_lessons')
+      .select('id, recording_title, sequence_order, duration_min, drip_days, module')
+      .in('module', moduleIds)
+      .order('sequence_order', { ascending: true });
+
+    if (!lessons?.length) return [];
+
+    // Per-context drip resolution:
+    //  - pathway view: read (pathway_id, course_id, lesson_id) overrides
+    //  - course view:  read (pathway_id IS NULL, course_id, lesson_id) overrides
+    const lessonIds = lessons.map(l => l.id);
+    let overrideMap = new Map<string, number>();
+    const overrideQuery = supabase
+      .from('lesson_drip_overrides' as any)
+      .select('lesson_id, drip_days, pathway_id, course_id')
+      .in('lesson_id', lessonIds)
+      .eq('course_id', courseId);
+
+    const { data: overrides } = type === 'pathway'
+      ? await overrideQuery.eq('pathway_id', entityId)
+      : await overrideQuery.is('pathway_id', null);
+
+    for (const o of (overrides as any[] | null) || []) {
+      overrideMap.set(o.lesson_id, o.drip_days);
+    }
+
+    return lessons.map(l => {
+      const mod = modules.find(m => m.id === l.module);
+      const hasOverride = overrideMap.has(l.id);
+      const effectiveDrip = hasOverride ? overrideMap.get(l.id)! : l.drip_days;
+      return {
+        id: l.id,
+        recording_title: l.recording_title,
+        sequence_order: l.sequence_order,
+        duration_min: l.duration_min,
+        drip_days: effectiveDrip,
+        module_id: l.module,
+        module_title: mod?.title || 'Unknown Module',
+        course_id: courseId,
+        course_title: courseTitle || entityName,
+        step_number: stepNumber ?? null,
+        has_override: hasOverride,
+        default_drip_days: l.drip_days,
+      };
+    });
+  };
+
+  const fetchCourseSessions = async (courses: { courseId: string; courseTitle: string; stepNumber: number | null }[]) => {
+    const courseIds = courses.map(c => c.courseId);
+    const { data } = await supabase
+      .from('success_sessions')
+      .select('id, title, schedule_date, course_id, drip_days' as any)
+      .in('course_id', courseIds)
+      .order('schedule_date', { ascending: true }) as { data: any[] | null };
+
+    const items: SessionItem[] = (data || []).map(s => {
+      const course = courses.find(c => c.courseId === s.course_id);
+      return {
+        id: s.id,
+        title: s.title,
+        schedule_date: s.schedule_date,
+        drip_days: (s as any).drip_days ?? null,
+        course_id: s.course_id,
+        course_title: course?.courseTitle || 'Unknown Course',
+        step_number: course?.stepNumber ?? null,
+      };
+    });
+    setSessions(items);
+  };
+
+  const fetchPathwayAll = async (pathwayId: string) => {
+    const { data: pathwayCourses } = await supabase
+      .from('pathway_courses')
+      .select('course_id, step_number, courses(title)')
+      .eq('pathway_id', pathwayId)
+      .order('step_number', { ascending: true });
+
+    if (!pathwayCourses?.length) {
+      setRecordings([]);
+      setSessions([]);
+      return;
+    }
+
+    const courses = pathwayCourses.map(pc => ({
+      courseId: pc.course_id,
+      courseTitle: (pc.courses as any)?.title || 'Unknown Course',
+      stepNumber: pc.step_number,
+    }));
+
+    const allItems: RecordingItem[] = [];
+    for (const c of courses) {
+      const items = await fetchCourseRecordings(c.courseId, c.courseTitle, c.stepNumber);
+      allItems.push(...items);
+    }
+    setRecordings(allItems);
+    await fetchCourseSessions(courses);
+  };
+
+  const handleDripDaysChange = (recordingId: string, value: string) => {
+    const numValue = value === '' ? null : parseInt(value);
+    setEditedDripDays(prev => ({ ...prev, [recordingId]: numValue }));
+  };
+
+  const handleResetToDefault = async (rec: RecordingItem) => {
+    if (!rec.course_id) return;
+    try {
+      const del = supabase
+        .from('lesson_drip_overrides' as any)
+        .delete()
+        .eq('lesson_id', rec.id)
+        .eq('course_id', rec.course_id);
+      const { error } = type === 'pathway'
+        ? await del.eq('pathway_id', entityId)
+        : await del.is('pathway_id', null);
+      if (error) throw error;
+      toast({ title: 'Reset', description: 'Reverted to default drip days.' });
+      setEditedDripDays(prev => {
+        const next = { ...prev };
+        delete next[rec.id];
+        return next;
+      });
+      await fetchAll();
+    } catch (error) {
+      logger.error('Error resetting override:', error);
+      toast({ title: 'Error', description: 'Failed to reset override', variant: 'destructive' });
+    }
+  };
+
+  const handleSessionDripDaysChange = (sessionId: string, value: string) => {
+    const numValue = value === '' ? null : parseInt(value);
+    setEditedSessionDripDays(prev => ({ ...prev, [sessionId]: numValue }));
+  };
+
+  const getDripDaysValue = (recording: RecordingItem): number | null => {
+    if (recording.id in editedDripDays) return editedDripDays[recording.id];
+    return recording.drip_days;
+  };
+
+  const getSessionDripDaysValue = (session: SessionItem): number | null => {
+    if (session.id in editedSessionDripDays) return editedSessionDripDays[session.id];
+    return session.drip_days;
+  };
+
+  const hasChanges = Object.keys(editedDripDays).length > 0 || Object.keys(editedSessionDripDays).length > 0 || Object.keys(editedSessionTitles).length > 0 || Object.keys(editedSequenceOrders).length > 0;
+
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+
+  const handleReorderRecordings = (
+    moduleId: string,
+    visibleRecs: RecordingItem[],
+    oldIndex: number,
+    newIndex: number,
+  ) => {
+    // Reorder by reassigning drip_days: the slot positions keep their drip values,
+    // and recordings move into the new slot order.
+    const reordered = arrayMove(visibleRecs, oldIndex, newIndex);
+    const dripSlots = visibleRecs.map(r => (r.id in editedDripDays ? editedDripDays[r.id] : r.drip_days));
+    const dripUpdates: Record<string, number | null> = {};
+    reordered.forEach((rec, idx) => {
+      const newDrip = dripSlots[idx];
+      const currentDrip = rec.id in editedDripDays ? editedDripDays[rec.id] : rec.drip_days;
+      if (newDrip !== currentDrip) dripUpdates[rec.id] = newDrip;
+    });
+    if (Object.keys(dripUpdates).length === 0) return;
+    setEditedDripDays(curr => ({ ...curr, ...dripUpdates }));
+    setRecordings(prev => prev.map(r => (r.id in dripUpdates ? { ...r, drip_days: dripUpdates[r.id] } : r)));
+  };
+
+  /**
+   * Compute schedule_date for a session based on earliest batch start_date + drip_days.
+   * Returns ISO date string or null if no batch found or drip_days is null.
+   */
+  const computeScheduleDate = async (courseId: string, dripDays: number | null): Promise<string | null> => {
+    if (dripDays == null) return null;
+
+    try {
+      // Check batch_courses for direct course associations
+      const { data: batchCourses } = await supabase
+        .from('batch_courses')
+        .select('batch_id, batches!inner(start_date)')
+        .eq('course_id', courseId);
+
+      // Check batch_pathways for pathway associations containing this course
+      const { data: pathwayCourses } = await supabase
+        .from('pathway_courses')
+        .select('pathway_id')
+        .eq('course_id', courseId);
+
+      let batchStartDates: string[] = (batchCourses || [])
+        .map((bc: any) => bc.batches?.start_date)
+        .filter(Boolean);
+
+      if (pathwayCourses?.length) {
+        const pathwayIds = pathwayCourses.map(pc => pc.pathway_id);
+        const { data: batchPathways } = await supabase
+          .from('batch_pathways')
+          .select('batch_id, batches!inner(start_date)')
+          .in('pathway_id', pathwayIds);
+
+        const pathwayBatchDates = (batchPathways || [])
+          .map((bp: any) => bp.batches?.start_date)
+          .filter(Boolean);
+        batchStartDates = [...batchStartDates, ...pathwayBatchDates];
+      }
+
+      // Also check legacy batch.course_id direct link
+      const { data: legacyBatches } = await supabase
+        .from('batches')
+        .select('start_date')
+        .eq('course_id', courseId)
+        .eq('status', 'active');
+
+      if (legacyBatches?.length) {
+        batchStartDates = [...batchStartDates, ...legacyBatches.map(b => b.start_date).filter(Boolean)];
+      }
+
+      if (!batchStartDates.length) return null;
+
+      // Pick earliest start date
+      const earliest = batchStartDates.sort()[0];
+      const scheduleDate = addDays(new Date(earliest), dripDays);
+      return format(scheduleDate, 'yyyy-MM-dd');
+    } catch (error) {
+      logger.error('Error computing schedule_date:', error);
+      return null;
+    }
+  };
+
+  const handleSave = async () => {
+    if (!hasChanges) return;
+    setSaving(true);
+    try {
+      // Save recording drip days as per-context OVERRIDES.
+      // We never touch available_lessons.drip_days from this dialog —
+      // that column stays as the global fallback so existing students
+      // resolving to the default remain unaffected.
+      for (const [id, drip_days] of Object.entries(editedDripDays)) {
+        const rec = recordings.find(r => r.id === id);
+        const courseIdForLesson = rec?.course_id;
+        if (!courseIdForLesson) continue;
+
+        const pathwayIdForOverride = type === 'pathway' ? entityId : null;
+
+        if (drip_days === null) {
+          // Clearing the value = remove the override so the fallback applies.
+          const del = supabase
+            .from('lesson_drip_overrides' as any)
+            .delete()
+            .eq('lesson_id', id)
+            .eq('course_id', courseIdForLesson);
+          const { error } = pathwayIdForOverride
+            ? await del.eq('pathway_id', pathwayIdForOverride)
+            : await del.is('pathway_id', null);
+          if (error) throw error;
+        } else {
+          // Upsert. Two partial unique indexes back this: one for pathway
+          // rows and one for course-only rows. We do a manual
+          // delete-then-insert to keep it simple across both cases.
+          const del = supabase
+            .from('lesson_drip_overrides' as any)
+            .delete()
+            .eq('lesson_id', id)
+            .eq('course_id', courseIdForLesson);
+          const delRes = pathwayIdForOverride
+            ? await del.eq('pathway_id', pathwayIdForOverride)
+            : await del.is('pathway_id', null);
+          if (delRes.error) throw delRes.error;
+
+          const { error: insErr } = await supabase
+            .from('lesson_drip_overrides' as any)
+            .insert({
+              lesson_id: id,
+              course_id: courseIdForLesson,
+              pathway_id: pathwayIdForOverride,
+              drip_days,
+            } as any);
+          if (insErr) throw insErr;
+        }
+      }
+      // Save session drip days, titles, and auto-calculate schedule_date
+      for (const [id, drip_days] of Object.entries(editedSessionDripDays)) {
+        const session = sessions.find(s => s.id === id);
+        const courseId = session?.course_id;
+        const schedule_date = courseId ? await computeScheduleDate(courseId, drip_days) : null;
+
+        const titleUpdate = editedSessionTitles[id];
+        const updatePayload: any = { drip_days, schedule_date };
+        if (titleUpdate !== undefined) updatePayload.title = titleUpdate;
+        const { error } = await supabase
+          .from('success_sessions')
+          .update(updatePayload)
+          .eq('id', id);
+        if (error) throw error;
+      }
+      // Save session titles that weren't already saved with drip days
+      for (const [id, title] of Object.entries(editedSessionTitles)) {
+        if (id in editedSessionDripDays) continue; // already handled
+        const { error } = await supabase
+          .from('success_sessions')
+          .update({ title } as any)
+          .eq('id', id);
+        if (error) throw error;
+      }
+
+      // Save recording sequence_order changes
+      for (const [id, sequence_order] of Object.entries(editedSequenceOrders)) {
+        const { error } = await supabase
+          .from('available_lessons')
+          .update({ sequence_order })
+          .eq('id', id);
+        if (error) throw error;
+      }
+
+      const totalUpdates = Object.keys(editedDripDays).length + Object.keys(editedSessionDripDays).length + Object.keys(editedSessionTitles).length + Object.keys(editedSequenceOrders).length;
+      toast({ title: "Success", description: `Updated ${totalUpdates} item(s)` });
+      setEditedDripDays({});
+      setEditedSequenceOrders({});
+      setEditedSessionDripDays({});
+      setEditedSessionTitles({});
+      await fetchAll();
+    } catch (error) {
+      logger.error('Error saving drip days:', error);
+      toast({ title: "Error", description: "Failed to save changes", variant: "destructive" });
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleStartAddSession = (courseId: string) => {
+    setAddingSessionForCourse(courseId);
+    setNewSessionTitle('');
+    setNewSessionDripDays(null);
+  };
+
+  const handleCancelAddSession = () => {
+    setAddingSessionForCourse(null);
+    setNewSessionTitle('');
+    setNewSessionDripDays(null);
+  };
+
+  const handleConfirmAddSession = async (courseId: string) => {
+    const trimmedTitle = newSessionTitle.trim();
+    if (!trimmedTitle || trimmedTitle.length > 200) {
+      toast({ title: "Validation", description: "Title is required (max 200 chars)", variant: "destructive" });
+      return;
+    }
+
+    setCreatingSession(true);
+    try {
+      // Auto-resolve mentor for this course
+      const { data: mentorAssignment } = await supabase
+        .from('mentor_course_assignments')
+        .select('mentor_id, profiles!mentor_course_assignments_mentor_id_fkey(full_name)')
+        .eq('course_id', courseId)
+        .order('is_primary', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      const mentorId = mentorAssignment?.mentor_id || null;
+      const mentorName = (mentorAssignment?.profiles as any)?.full_name || null;
+
+      // Auto-calculate schedule_date from batch start_date + drip_days
+      const schedule_date = await computeScheduleDate(courseId, newSessionDripDays);
+
+      // When opened from a pathway context, set pathway_id
+      const pathwayId = type === 'pathway' ? entityId : null;
+
+      // If opened from course context, check if course belongs to multiple pathways and clone
+      let sessionsToInsert: any[] = [];
+      if (type === 'course') {
+        const { data: pcLinks } = await supabase
+          .from('pathway_courses')
+          .select('pathway_id')
+          .eq('course_id', courseId);
+        const pathwayIds = (pcLinks || []).map(pc => pc.pathway_id);
+        
+        if (pathwayIds.length > 1) {
+          // Clone per pathway
+          sessionsToInsert = pathwayIds.map(pid => ({
+            title: trimmedTitle,
+            course_id: courseId,
+            mentor_id: mentorId,
+            mentor_name: mentorName,
+            link: 'TBD',
+            start_time: new Date().toISOString(),
+            status: 'upcoming',
+            drip_days: newSessionDripDays,
+            schedule_date,
+            pathway_id: pid,
+          }));
+        } else {
+          sessionsToInsert = [{
+            title: trimmedTitle,
+            course_id: courseId,
+            mentor_id: mentorId,
+            mentor_name: mentorName,
+            link: 'TBD',
+            start_time: new Date().toISOString(),
+            status: 'upcoming',
+            drip_days: newSessionDripDays,
+            schedule_date,
+            pathway_id: pathwayIds[0] || null,
+          }];
+        }
+      } else {
+        sessionsToInsert = [{
+          title: trimmedTitle,
+          course_id: courseId,
+          mentor_id: mentorId,
+          mentor_name: mentorName,
+          link: 'TBD',
+          start_time: new Date().toISOString(),
+          status: 'upcoming',
+          drip_days: newSessionDripDays,
+          schedule_date,
+          pathway_id: pathwayId,
+        }];
+      }
+
+      const { error } = await supabase
+        .from('success_sessions')
+        .insert(sessionsToInsert as any);
+
+      if (error) throw error;
+
+      toast({ title: "Success", description: `Live session "${trimmedTitle}" created` });
+      handleCancelAddSession();
+      await fetchAll();
+    } catch (error) {
+      logger.error('Error creating session:', error);
+      toast({ title: "Error", description: "Failed to create session", variant: "destructive" });
+    } finally {
+      setCreatingSession(false);
+    }
+  };
+
+  const handleDeleteSession = async (sessionId: string) => {
+    setDeletingSessionId(sessionId);
+    try {
+      const { error } = await supabase
+        .from('success_sessions')
+        .delete()
+        .eq('id', sessionId);
+      if (error) throw error;
+      toast({ title: "Deleted", description: "Live session removed" });
+      await fetchAll();
+    } catch (error) {
+      logger.error('Error deleting session:', error);
+      toast({ title: "Error", description: "Failed to delete session", variant: "destructive" });
+    } finally {
+      setDeletingSessionId(null);
+    }
+  };
+
+  // Group recordings by course then by module
+  const groupedByCourse = recordings.reduce((acc, r) => {
+    const courseKey = r.course_id || 'unknown';
+    if (!acc[courseKey]) {
+      acc[courseKey] = { title: r.course_title, stepNumber: r.step_number, modules: {} };
+    }
+    const moduleKey = r.module_id || 'unknown';
+    if (!acc[courseKey].modules[moduleKey]) {
+      acc[courseKey].modules[moduleKey] = { title: r.module_title, recordings: [] };
+    }
+    acc[courseKey].modules[moduleKey].recordings.push(r);
+    return acc;
+  }, {} as Record<string, { title: string; stepNumber: number | null; modules: Record<string, { title: string; recordings: RecordingItem[] }> }>);
+
+  // Group sessions by course
+  const sessionsByCourse = sessions.reduce((acc, s) => {
+    const courseKey = s.course_id || 'unknown';
+    if (!acc[courseKey]) acc[courseKey] = [];
+    acc[courseKey].push(s);
+    return acc;
+  }, {} as Record<string, SessionItem[]>);
+
+  // Merge course keys from both recordings and sessions
+  const allCourseKeys = new Set([...Object.keys(groupedByCourse), ...Object.keys(sessionsByCourse)]);
+  
+  const courseEntries = Array.from(allCourseKeys).map(key => {
+    const recData = groupedByCourse[key];
+    const sesData = sessionsByCourse[key] || [];
+    return {
+      courseId: key,
+      title: recData?.title || sesData[0]?.course_title || 'Unknown Course',
+      stepNumber: recData?.stepNumber ?? sesData[0]?.step_number ?? null,
+      modules: recData?.modules || {},
+      sessions: sesData,
+    };
+  }).sort((a, b) => (a.stepNumber ?? 0) - (b.stepNumber ?? 0));
+
+  const hasContent = recordings.length > 0 || sessions.length > 0;
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-3xl w-[95vw] max-h-[85vh] flex flex-col overflow-hidden">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2 flex-wrap">
+            <Clock className="w-5 h-5" />
+            Content Timeline - {entityName}
+            <Badge variant={type === 'pathway' ? 'default' : 'secondary'} className="text-[10px] uppercase tracking-wide">
+              {type === 'pathway'
+                ? `Editing: Pathway drip (${entityName})`
+                : `Editing: Course-only drip (${entityName})`}
+            </Badge>
+          </DialogTitle>
+          <p className="text-xs text-muted-foreground mt-1">
+            {type === 'pathway'
+              ? 'Changes apply only to students enrolled through this pathway. Other pathways and standalone course enrollments are unaffected.'
+              : 'Changes apply only to students enrolled directly in this course (no pathway). Pathway-scoped drip values are unaffected.'}
+          </p>
+        </DialogHeader>
+
+        <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none]">
+        {loading ? (
+          <div className="flex items-center justify-center py-12">
+            <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+          </div>
+        ) : !hasContent ? (
+          <p className="text-center text-muted-foreground py-8">
+            No recordings or sessions found. Add modules, recordings, or live sessions first.
+          </p>
+        ) : (
+          <div className="space-y-4">
+            {courseEntries.map((courseData) => (
+              <div key={courseData.courseId} className="space-y-3">
+                {type === 'pathway' && (
+                  <div className="flex items-center gap-2 pt-2 border-t first:border-t-0 first:pt-0">
+                    <Badge variant="outline" className="text-xs">
+                      Step {courseData.stepNumber}
+                    </Badge>
+                    <span className="font-semibold text-sm">{courseData.title}</span>
+                  </div>
+                )}
+
+                {Object.entries(courseData.modules)
+                  .map(([moduleId, moduleData]) => {
+                    const minDrip = Math.min(
+                      ...moduleData.recordings.map(r => getDripDaysValue(r) ?? Number.POSITIVE_INFINITY),
+                      Number.POSITIVE_INFINITY
+                    );
+                    return { moduleId, moduleData, minDrip };
+                  })
+                  .sort((a, b) => a.minDrip - b.minDrip)
+                  .map(({ moduleId, moduleData }) => {
+                  // Sort by drip days ascending (nulls last), then sequence_order as tiebreaker
+                  const sortedRecs = [...moduleData.recordings].sort((a, b) => {
+                    const aDrip = getDripDaysValue(a) ?? Number.POSITIVE_INFINITY;
+                    const bDrip = getDripDaysValue(b) ?? Number.POSITIVE_INFINITY;
+                    if (aDrip !== bDrip) return aDrip - bDrip;
+                    const aSeq = a.sequence_order ?? Number.POSITIVE_INFINITY;
+                    const bSeq = b.sequence_order ?? Number.POSITIVE_INFINITY;
+                    return aSeq - bSeq;
+                  });
+                  const dedupedRecs = sortedRecs;
+
+
+                  return (
+                  <div key={moduleId} className="space-y-1">
+                    <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide pl-1">
+                      {moduleData.title}
+                    </p>
+                    <div className="border rounded-md divide-y">
+                      <DndContext
+                        sensors={sensors}
+                        collisionDetection={closestCenter}
+                        onDragEnd={(event: DragEndEvent) => {
+                          const { active, over } = event;
+                          if (!over || active.id === over.id) return;
+                          const oldIndex = dedupedRecs.findIndex(r => r.id === active.id);
+                          const newIndex = dedupedRecs.findIndex(r => r.id === over.id);
+                          if (oldIndex === -1 || newIndex === -1) return;
+                          handleReorderRecordings(moduleId, dedupedRecs, oldIndex, newIndex);
+                        }}
+                      >
+                        <SortableContext items={dedupedRecs.map(r => r.id)} strategy={verticalListSortingStrategy}>
+                          {dedupedRecs.map((rec, idx) => {
+                            const currentValue = getDripDaysValue(rec);
+                            const isEdited = rec.id in editedDripDays;
+                            const isReordered = rec.id in editedSequenceOrders;
+                            return (
+                              <SortableRecordingRow
+                                key={rec.id}
+                                rec={rec}
+                                displayOrder={idx + 1}
+                                currentValue={currentValue}
+                                isEdited={isEdited}
+                                isReordered={isReordered}
+                                scope={type}
+                                onDripDaysChange={handleDripDaysChange}
+                                onReset={handleResetToDefault}
+                              />
+                            );
+                          })}
+                        </SortableContext>
+                      </DndContext>
+                    </div>
+                  </div>
+                  );
+                })}
+
+                {(courseData.sessions.length > 0 || true) && (
+                  <div className="space-y-1">
+                    <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide pl-1 flex items-center gap-1.5">
+                      <Video className="w-3.5 h-3.5" />
+                      Live Sessions
+                    </p>
+                    <div className="border rounded-md divide-y">
+                      {courseData.sessions.map((session) => {
+                        const currentValue = getSessionDripDaysValue(session);
+                        const isEdited = session.id in editedSessionDripDays;
+                        return (
+                          <div key={session.id} className="flex items-center gap-3 px-3 py-2">
+                            <Video className="w-4 h-4 text-muted-foreground shrink-0" />
+                            {editingTitleId === session.id ? (
+                              <Input
+                                type="text"
+                                value={editedSessionTitles[session.id] ?? session.title}
+                                onChange={(e) => setEditedSessionTitles(prev => ({ ...prev, [session.id]: e.target.value }))}
+                                onBlur={() => setEditingTitleId(null)}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === 'Escape') setEditingTitleId(null);
+                                }}
+                                className="h-7 text-sm flex-1"
+                                autoFocus
+                                maxLength={200}
+                              />
+                            ) : (
+                              <span
+                                className="text-sm flex-1 truncate cursor-pointer hover:text-primary transition-colors"
+                                onClick={() => setEditingTitleId(session.id)}
+                                title="Click to edit title"
+                              >
+                                {editedSessionTitles[session.id] ?? session.title ?? 'Untitled Session'}
+                              </span>
+                            )}
+                            {session.schedule_date && (
+                              <span className="text-xs text-muted-foreground shrink-0">
+                                {new Date(session.schedule_date).toLocaleDateString()}
+                              </span>
+                            )}
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <Input
+                                type="number"
+                                min={0}
+                                value={currentValue ?? ''}
+                                onChange={(e) => handleSessionDripDaysChange(session.id, e.target.value)}
+                                className={`w-20 h-8 text-sm ${isEdited ? 'border-primary ring-1 ring-primary/30' : ''}`}
+                                placeholder="0"
+                              />
+                              <span className="text-xs text-muted-foreground">days</span>
+                            </div>
+                            <Button
+                              size="icon"
+                              variant="ghost"
+                              className="h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive"
+                              onClick={() => handleDeleteSession(session.id)}
+                              disabled={deletingSessionId === session.id}
+                            >
+                              {deletingSessionId === session.id ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                            </Button>
+                          </div>
+                        );
+                      })}
+
+                      {/* Inline add session row */}
+                      {addingSessionForCourse === courseData.courseId ? (
+                        <div className="flex items-center gap-2 px-3 py-2">
+                          <Video className="w-4 h-4 text-muted-foreground shrink-0" />
+                          <Input
+                            type="text"
+                            value={newSessionTitle}
+                            onChange={(e) => setNewSessionTitle(e.target.value)}
+                            className="h-8 text-sm flex-1"
+                            placeholder="Session title..."
+                            maxLength={200}
+                            autoFocus
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') handleConfirmAddSession(courseData.courseId);
+                              if (e.key === 'Escape') handleCancelAddSession();
+                            }}
+                          />
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            <Input
+                              type="number"
+                              min={0}
+                              value={newSessionDripDays ?? ''}
+                              onChange={(e) => setNewSessionDripDays(e.target.value === '' ? null : parseInt(e.target.value))}
+                              className="w-20 h-8 text-sm"
+                              placeholder="0"
+                            />
+                            <span className="text-xs text-muted-foreground">days</span>
+                          </div>
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="h-7 w-7 shrink-0"
+                            onClick={() => handleConfirmAddSession(courseData.courseId)}
+                            disabled={creatingSession}
+                          >
+                            {creatingSession ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4 text-primary" />}
+                          </Button>
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="h-7 w-7 shrink-0"
+                            onClick={handleCancelAddSession}
+                            disabled={creatingSession}
+                          >
+                            <X className="w-4 h-4 text-destructive" />
+                          </Button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => handleStartAddSession(courseData.courseId)}
+                          className="flex items-center gap-2 px-3 py-2 w-full text-sm text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                        >
+                          <Plus className="w-4 h-4" />
+                          Add Live Session
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            Close
+          </Button>
+          <Button onClick={handleSave} disabled={!hasChanges || saving}>
+            {saving ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Save className="w-4 h-4 mr-2" />}
+            Save All
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+interface SortableRecordingRowProps {
+  rec: RecordingItem;
+  displayOrder: number;
+  currentValue: number | null;
+  isEdited: boolean;
+  isReordered: boolean;
+  scope: 'course' | 'pathway';
+  onDripDaysChange: (id: string, value: string) => void;
+  onReset: (rec: RecordingItem) => void;
+}
+
+function SortableRecordingRow({ rec, displayOrder, currentValue, isEdited, isReordered, scope, onDripDaysChange, onReset }: SortableRecordingRowProps) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: rec.id });
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+  };
+  const tierLabel = rec.has_override
+    ? (scope === 'pathway' ? 'Pathway override' : 'Course override')
+    : 'Default';
+  const tierVariant: 'default' | 'secondary' | 'outline' = rec.has_override ? 'default' : 'outline';
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={`flex items-center gap-3 px-3 py-2 bg-background ${isReordered ? 'border-l-2 border-primary' : ''}`}
+    >
+      <button
+        type="button"
+        className="touch-none cursor-grab active:cursor-grabbing text-muted-foreground hover:text-foreground shrink-0"
+        {...attributes}
+        {...listeners}
+        aria-label="Drag to reorder"
+      >
+        <GripVertical className="w-4 h-4" />
+      </button>
+      <span className="text-xs font-medium text-muted-foreground w-6 text-right shrink-0">
+        {displayOrder}
+      </span>
+      <span className="text-sm flex-1 truncate">{rec.recording_title || 'Untitled'}</span>
+      <Badge variant={tierVariant} className="text-[10px] shrink-0" title={rec.has_override ? `Default is ${rec.default_drip_days ?? 0} days` : undefined}>
+        {tierLabel}
+      </Badge>
+      {rec.duration_min != null && (
+        <span className="text-xs text-muted-foreground shrink-0">
+          {rec.duration_min}m
+        </span>
+      )}
+      <div className="flex items-center gap-1.5 shrink-0">
+        <Input
+          type="number"
+          min={0}
+          value={currentValue ?? ''}
+          onChange={(e) => onDripDaysChange(rec.id, e.target.value)}
+          className={`w-20 h-8 text-sm ${isEdited ? 'border-primary ring-1 ring-primary/30' : ''}`}
+          placeholder="0"
+        />
+        <span className="text-xs text-muted-foreground">days</span>
+      </div>
+      {rec.has_override && (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-7 px-2 text-xs shrink-0 text-muted-foreground hover:text-foreground"
+          onClick={() => onReset(rec)}
+          title={`Reset to default (${rec.default_drip_days ?? 0} days)`}
+        >
+          Reset
+        </Button>
+      )}
+    </div>
+  );
+}

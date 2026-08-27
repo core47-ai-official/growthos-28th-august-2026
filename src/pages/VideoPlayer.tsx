@@ -1,0 +1,746 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import { useParams, useNavigate, useSearchParams } from "react-router-dom";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { CheckCircle, ArrowLeft, Play, Lock, MessageCircle, RefreshCw, ArrowRight, Star, Maximize, Minimize } from "lucide-react";
+import { useCourseRecordings } from "@/hooks/useCourseRecordings";
+import SuccessPartner from "@/components/SuccessPartner";
+import { LectureRating } from "@/components/LectureRating";
+import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/hooks/useAuth";
+import { safeMaybeSingle } from '@/lib/database-safety';
+import { logger } from '@/lib/logger';
+import CurrentModuleCard from "@/components/CurrentModuleCard";
+import { obfuscateUrl, deobfuscateUrl } from "@/lib/utils";
+import { logUserActivity, ACTIVITY_TYPES } from "@/lib/activity-logger";
+import { setSessionActivity } from "@/hooks/useSessionHeartbeat";
+import { getResourceFileSignedUrl } from "@/hooks/useResources";
+import { VideoWatermark } from "@/components/security/VideoWatermark";
+import { useSecuritySignals } from "@/hooks/useSecuritySignals";
+import { AlertTriangle } from "lucide-react";
+
+// Sanitize video URLs by removing garbage prefixes
+const sanitizeVideoUrl = (url: string): string => {
+  if (!url) return '';
+  
+  let cleanUrl = url.trim();
+  
+  // Remove common garbage prefixes that may have been copy-pasted
+  const garbagePrefixes = [
+    'ChatGPT said:',
+    'AI said:',
+    'AI:',
+    'Copy:',
+    'Link:',
+    'URL:',
+  ];
+  
+  for (const prefix of garbagePrefixes) {
+    if (cleanUrl.toLowerCase().startsWith(prefix.toLowerCase())) {
+      cleanUrl = cleanUrl.substring(prefix.length).trim();
+    }
+  }
+  
+  // Validate it's a proper URL
+  if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+    return '';
+  }
+  
+  return cleanUrl;
+};
+
+const VideoPlayer = () => {
+  const {
+    moduleId,
+    lessonId
+  } = useParams();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const {
+    user,
+    loading: authLoading
+  } = useAuth();
+  const [showSuccessPartner, setShowSuccessPartner] = useState(false);
+  const [checkedItems, setCheckedItems] = useState<{
+    [key: number]: boolean;
+  }>({});
+  const [currentVideo, setCurrentVideo] = useState<any>(null);
+  const { recordings, refreshData: refreshRecordings } = useCourseRecordings(currentVideo?.courseId || null);
+  const [showRating, setShowRating] = useState(false);
+
+  useEffect(() => {
+    const onRated = () => refreshRecordings();
+    window.addEventListener('lovable:recording-rated', onRated);
+    return () => window.removeEventListener('lovable:recording-rated', onRated);
+  }, [refreshRecordings]);
+  const [videoUrlError, setVideoUrlError] = useState(false);
+  const [videoWatched, setVideoWatched] = useState(false);
+  const [iframeKey, setIframeKey] = useState(0);
+  const [obfuscatedUrl, setObfuscatedUrl] = useState<string>("");
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const playerContainerRef = useRef<HTMLDivElement>(null);
+
+  // Heuristic playback-signal logging. Advisory only: it never blocks playback,
+  // never signs anyone out, and its signals include expected false positives.
+  const { showSoftWarning } = useSecuritySignals({
+    userId: user?.id,
+    videoId: currentVideo?.id ?? null,
+    enabled: !!currentVideo?.id,
+  });
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // Keep the identity watermark visible in fullscreen: Bunny's player puts the
+  // iframe itself fullscreen, which would hide sibling overlays. We expose our
+  // own fullscreen button that puts the *wrapper* fullscreen (direct user
+  // gesture = always allowed), and keep a best-effort redirect if the user uses
+  // the player's built-in button instead.
+  useEffect(() => {
+    const onFsChange = () => {
+      const fsEl = document.fullscreenElement;
+      const container = playerContainerRef.current;
+      if (fsEl && container && fsEl === iframeRef.current) {
+        document.exitFullscreen()
+          .then(() => container.requestFullscreen())
+          .catch(() => { /* fullscreen redirect not permitted */ });
+        return;
+      }
+      setIsFullscreen(!!fsEl && fsEl === container);
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+    return () => document.removeEventListener('fullscreenchange', onFsChange);
+  }, []);
+
+  const toggleFullscreen = useCallback(() => {
+    const container = playerContainerRef.current;
+    if (!container) return;
+    if (document.fullscreenElement) {
+      void document.exitFullscreen().catch(() => {});
+    } else {
+      void container.requestFullscreen().catch(() => {});
+    }
+  }, []);
+
+
+
+  
+  interface Attachment {
+    id: string;
+    file_name: string;
+    file_url: string | null;
+    uploaded_at: string;
+    resource_id?: string | null;
+  }
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+
+  // Helper to extract URLs from description for attachments (simple auto-link)
+  const extractLinks = (text: string): string[] => {
+    const urlRegex = /(https?:\/\/[^\s)]+|www\.[^\s)]+)/g;
+    return text ? (text.match(urlRegex) || []).map(u => u.startsWith('http') ? u : `http://${u}`) : [];
+  };
+
+  // Helper to convert YouTube URLs to embed format and add BunnyStream parameters
+  const convertToEmbedUrl = (url: string): string => {
+    if (!url) return '';
+    
+    // Handle BunnyStream URLs - add required parameters for proper playback
+    if (url.includes('iframe.mediadelivery.net/embed/')) {
+      const hasParams = url.includes('?');
+      const bunnyParams = 'autoplay=true&loop=false&muted=false&preload=true&responsive=true';
+      return hasParams ? `${url}&${bunnyParams}` : `${url}?${bunnyParams}`;
+    }
+    
+    // If already an embed URL, return as is
+    if (url.includes('youtube.com/embed/') || url.includes('youtu.be/embed/')) {
+      return url;
+    }
+    
+    // Extract video ID from various YouTube URL formats
+    let videoId = '';
+    
+    // Standard YouTube URL: https://www.youtube.com/watch?v=VIDEO_ID
+    if (url.includes('youtube.com/watch?v=')) {
+      const match = url.match(/[?&]v=([^&]+)/);
+      if (match) videoId = match[1];
+    }
+    // Short YouTube URL: https://youtu.be/VIDEO_ID
+    else if (url.includes('youtu.be/')) {
+      const match = url.match(/youtu\.be\/([^?&]+)/);
+      if (match) videoId = match[1];
+    }
+    // YouTube URL with additional parameters
+    else if (url.includes('youtube.com') && url.includes('v=')) {
+      const match = url.match(/[?&]v=([^&]+)/);
+      if (match) videoId = match[1];
+    }
+    
+    // Clean video ID (remove any additional parameters)
+    if (videoId) {
+      videoId = videoId.split('&')[0].split('?')[0];
+      return `https://www.youtube.com/embed/${videoId}`;
+    }
+    
+    // If not a YouTube URL, return as is (for other video platforms)
+    return url;
+  };
+
+  const attachmentLinks = currentVideo?.description ? extractLinks(currentVideo.description) : [];
+
+  // Initialize video data from URL params or by ID
+  useEffect(() => {
+    const videoUrl = searchParams.get('url');
+    const videoTitle = searchParams.get('title');
+    const videoId = searchParams.get('id');
+    const setFromParams = () => {
+      if (videoUrl && videoTitle) {
+        setCurrentVideo({
+          id: videoId,
+          title: decodeURIComponent(videoTitle),
+          description: "Watch this lesson to continue your learning journey.",
+          videoUrl: decodeURIComponent(videoUrl),
+          duration: "N/A",
+          module: "Current Module",
+          checklist: ["Watch the complete video", "Take notes on key concepts", "Complete any related assignments", "Mark lesson as complete"]
+        });
+        return true;
+      }
+      return false;
+    };
+    const loadById = async (id: string) => {
+      try {
+        const {
+          data,
+          error
+        } = await supabase.from('available_lessons').select('id, recording_title, recording_url, duration_min, module, notes').eq('id', id).maybeSingle();
+        if (error) throw error;
+        if (data) {
+          // Resolve module name and course name from module UUID
+                  let moduleName = 'Module';
+          let courseName = '';
+                  let courseId: string | null = null;
+          if (data.module) {
+            const { data: moduleData } = await supabase
+              .from('modules')
+              .select('id, title, course_id')
+              .eq('id', data.module)
+              .maybeSingle();
+            if (moduleData) {
+              moduleName = moduleData.title || 'Module';
+                      courseId = moduleData.course_id;
+              if (moduleData.course_id) {
+                const { data: courseData } = await supabase
+                  .from('courses')
+                  .select('title')
+                  .eq('id', moduleData.course_id)
+                  .maybeSingle();
+                if (courseData) courseName = courseData.title || '';
+              }
+            }
+          }
+          setCurrentVideo({
+            id: data.id,
+            title: data.recording_title || 'Lesson',
+            description: data.notes || 'Watch this lesson to continue your learning journey.',
+            videoUrl: data.recording_url || '',
+            duration: data.duration_min ? `${data.duration_min} min` : 'N/A',
+            module: moduleName,
+            moduleId: data.module,
+              courseId,
+            courseName: courseName,
+            checklist: ['Watch the complete video', 'Take notes on key concepts', 'Complete any related assignments', 'Mark lesson as complete']
+          });
+          return;
+        }
+      } catch (e) {
+        logger.error('VideoPlayer: failed to load by id', e);
+      }
+      // Fallback mock if not found
+      setCurrentVideo({
+        id: lessonId,
+        title: 'Market Research Basics',
+        description: 'Learn how to conduct effective market research to identify profitable niches and understand your target audience.',
+        videoUrl: 'https://www.youtube.com/embed/dQw4w9WgXcQ',
+        duration: '18:20',
+        module: 'Introduction to E-commerce',
+        checklist: ['Identify your target market', 'Analyze market size and potential', 'Study competitor pricing strategies', 'Research customer pain points', 'Create buyer personas']
+      });
+    };
+
+    // Prefer explicit params
+    if (!setFromParams()) {
+      if (videoId) {
+        loadById(videoId);
+      } else {
+        // Legacy route fallback
+        setCurrentVideo({
+          id: lessonId,
+          title: 'Market Research Basics',
+          description: 'Learn how to conduct effective market research to identify profitable niches and understand your target audience.',
+          videoUrl: 'https://www.youtube.com/embed/dQw4w9WgXcQ',
+          duration: '18:20',
+          module: 'Introduction to E-commerce',
+          checklist: ['Identify your target market', 'Analyze market size and potential', 'Study competitor pricing strategies', 'Research customer pain points', 'Create buyer personas']
+        });
+      }
+    }
+  }, [searchParams, lessonId]);
+
+  // Broadcast which video is currently being watched for session/device tracking
+  useEffect(() => {
+    if (!currentVideo?.id) return;
+    setSessionActivity({
+      type: 'video',
+      recording_id: currentVideo.id,
+      title: currentVideo.title,
+      started_at: new Date().toISOString(),
+    });
+    return () => setSessionActivity(null);
+  }, [currentVideo?.id, currentVideo?.title]);
+
+  // Access-pattern telemetry: one "open" event per lesson + heartbeats while the
+  // page stays active. Used server-side to identify bulk downloading / recording.
+  useEffect(() => {
+    if (!user?.id || !currentVideo?.id) return;
+    let cancelled = false;
+
+    const deviceLabel = (() => {
+      const ua = navigator.userAgent;
+      const os = /Windows/i.test(ua) ? 'Windows'
+        : /Mac OS X|Macintosh/i.test(ua) ? 'macOS'
+        : /Android/i.test(ua) ? 'Android'
+        : /iPhone|iPad|iOS/i.test(ua) ? 'iOS'
+        : /Linux/i.test(ua) ? 'Linux' : 'Unknown OS';
+      const browser = /Edg\//i.test(ua) ? 'Edge'
+        : /Chrome\//i.test(ua) ? 'Chrome'
+        : /Firefox\//i.test(ua) ? 'Firefox'
+        : /Safari\//i.test(ua) ? 'Safari' : 'Browser';
+      return `${browser} on ${os}`;
+    })();
+
+    const logEvent = async (eventType: 'open' | 'heartbeat') => {
+      try {
+        await supabase.from('video_access_events').insert({
+          user_id: user.id,
+          recording_id: currentVideo.id,
+          event_type: eventType,
+          user_agent: navigator.userAgent,
+          device_label: deviceLabel,
+          page_url: window.location.href,
+        });
+      } catch {
+        /* telemetry must never break playback */
+      }
+    };
+
+    (async () => {
+      await logEvent('open');
+      if (cancelled) return;
+      // Evaluate this user's recent pattern right after the open event.
+      try {
+        await supabase.functions.invoke('detect-capture-patterns', { body: { mode: 'self' } });
+      } catch {
+        /* noop */
+      }
+    })();
+
+    const heartbeat = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void logEvent('heartbeat');
+    }, 60_000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(heartbeat);
+    };
+  }, [user?.id, currentVideo?.id]);
+
+
+
+  // Auto-mark video as watched when the player page loads
+  useEffect(() => {
+    const autoMarkWatched = async () => {
+      if (!user?.id || !currentVideo?.id) return;
+      try {
+        // Check prior watched status to differentiate "opened" vs "completed now"
+        const { data: prior } = await supabase
+          .from('recording_views')
+          .select('watched')
+          .eq('user_id', user.id)
+          .eq('recording_id', currentVideo.id)
+          .maybeSingle();
+        const alreadyWatched = !!prior?.watched;
+
+        await supabase.from('recording_views').upsert({
+          user_id: user.id,
+          recording_id: currentVideo.id,
+          watched: true,
+          watched_at: new Date().toISOString()
+        }, { onConflict: 'user_id,recording_id' });
+        setVideoWatched(true);
+        logger.info('Auto-marked video as watched:', currentVideo.id);
+
+        const courseNameParam = searchParams.get('course') ? decodeURIComponent(searchParams.get('course') || '') : undefined;
+        const metaBase = {
+          video_title: currentVideo.title,
+          module_name: currentVideo.module,
+          course_name: courseNameParam || currentVideo.courseName || 'N/A',
+          timestamp: new Date().toISOString(),
+          already_watched: alreadyWatched
+        };
+
+        // Always log that the user opened the video (gives admins per-video page-visit context)
+        logUserActivity({
+          user_id: user.id,
+          activity_type: 'video_opened',
+          reference_id: currentVideo.id,
+          metadata: metaBase
+        });
+
+        // Log a completion event only the first time it transitions to watched
+        if (!alreadyWatched) {
+          logUserActivity({
+            user_id: user.id,
+            activity_type: ACTIVITY_TYPES.VIDEO_WATCHED,
+            reference_id: currentVideo.id,
+            metadata: metaBase
+          });
+        }
+      } catch (error) {
+        logger.error('Error auto-marking video watched:', error);
+      }
+    };
+    autoMarkWatched();
+  }, [user?.id, currentVideo?.id]);
+
+  // Auto-open the rating card when navigated with ?rate=1 (from "Rate to unlock" badges/tags)
+  useEffect(() => {
+    if (searchParams.get('rate') === '1' && currentVideo?.id) {
+      setShowRating(true);
+      setTimeout(() => {
+        document.getElementById('lecture-rating-anchor')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }, 300);
+      // Strip ?rate=1 so back/forward navigation doesn't re-trigger it
+      const next = new URLSearchParams(searchParams);
+      next.delete('rate');
+      navigate({ search: next.toString() ? `?${next.toString()}` : '' }, { replace: true });
+    }
+  }, [searchParams, currentVideo?.id, navigate]);
+
+
+  // Load attachments for current video
+  useEffect(() => {
+    const loadAttachments = async () => {
+      if (!currentVideo?.id) return;
+      try {
+        const {
+          data,
+          error
+        } = (await supabase.from('recording_attachments' as any).select('id, file_name, file_url, uploaded_at, resource_id').eq('recording_id', currentVideo.id).order('uploaded_at', {
+          ascending: false
+        })) as any;
+        if (!error) setAttachments(data as Attachment[] || []);
+      } catch (e) {
+        logger.error('Failed to load attachments', e);
+      }
+    };
+    loadAttachments();
+  }, [currentVideo?.id]);
+
+  // Set iframe src via ref to hide URL from DOM
+  useEffect(() => {
+    if (currentVideo?.videoUrl && iframeRef.current) {
+      // Sanitize the URL first
+      const sanitizedUrl = sanitizeVideoUrl(currentVideo.videoUrl);
+      
+      if (!sanitizedUrl) {
+        setVideoUrlError(true);
+        logger.error('Invalid video URL detected:', currentVideo.videoUrl);
+        return;
+      }
+      
+      setVideoUrlError(false);
+      const embedUrl = convertToEmbedUrl(sanitizedUrl);
+      const encoded = obfuscateUrl(embedUrl);
+      setObfuscatedUrl(encoded);
+      
+      // Set src via ref instead of JSX to hide from Elements tab
+      iframeRef.current.src = embedUrl;
+    }
+    // Removed cleanup that was causing blank video issues
+  }, [currentVideo?.videoUrl, iframeKey]);
+  
+  // modules list moved to CurrentModuleCard via useVideosData
+
+  const handleChecklistToggle = (index: number) => {
+    setCheckedItems(prev => ({
+      ...prev,
+      [index]: !prev[index]
+    }));
+  };
+  // Video selection handled by CurrentModuleCard
+
+  const checkVideoCompletion = async () => {
+    if (!user?.id || !currentVideo?.id) return;
+    try {
+      // Check if recording has been watched and no rating exists yet
+      const watchedResult = await safeMaybeSingle(supabase.from('recording_views').select('watched').eq('user_id', user.id).eq('recording_id', currentVideo.id).eq('watched', true).maybeSingle() as any, `check if recording ${currentVideo.id} was watched by user ${user.id}`);
+      const ratingResult = await safeMaybeSingle(supabase.from('recording_ratings' as any).select('id').eq('student_id', user.id).eq('recording_id', currentVideo.id).maybeSingle() as any, `check if recording ${currentVideo.id} was rated by user ${user.id}`);
+      if (watchedResult.data && !ratingResult.data) {
+        setShowRating(true);
+      }
+    } catch (error) {
+      logger.error('Error checking video completion:', error);
+    }
+  };
+  const handleMarkComplete = async () => {
+    if (!user?.id || !currentVideo?.id) return;
+    try {
+      // Mark recording as watched
+      await supabase.from('recording_views').upsert({
+        user_id: user.id,
+        recording_id: currentVideo.id,
+        watched: true,
+        watched_at: new Date().toISOString()
+      });
+      setVideoWatched(true);
+
+      // Log video watched activity with course context
+      const courseNameParam = searchParams.get('course') ? decodeURIComponent(searchParams.get('course') || '') : undefined;
+      logUserActivity({
+        user_id: user.id,
+        activity_type: ACTIVITY_TYPES.VIDEO_WATCHED,
+        reference_id: currentVideo.id,
+        metadata: {
+          video_title: currentVideo.title,
+          module_name: currentVideo.module,
+          course_name: courseNameParam || currentVideo.courseName || 'N/A',
+          timestamp: new Date().toISOString()
+        }
+      });
+
+      // Refresh recordings/unlocks so the next lesson becomes available
+      refreshRecordings();
+      setTimeout(() => refreshRecordings(), 800);
+      setTimeout(() => refreshRecordings(), 2500);
+
+      // Check if should show rating
+      setTimeout(() => {
+        checkVideoCompletion();
+      }, 1000);
+    } catch (error) {
+      console.error('Error marking video complete:', error);
+    }
+  };
+  return <div>
+      <div className="flex items-center gap-3 mb-4">
+        <Button variant="outline" size="sm" onClick={() => navigate('/videos')} className="flex items-center gap-2">
+          <ArrowLeft className="w-4 h-4" />
+          Back to Videos
+        </Button>
+      </div>
+
+      {showSoftWarning && (
+        <Alert className="mb-4 border-amber-300 bg-amber-50">
+          <AlertTriangle className="h-4 w-4 text-amber-600" />
+          <AlertDescription className="text-amber-900">
+            We noticed unusual activity during this session. Recording or downloading course content violates our terms.
+          </AlertDescription>
+        </Alert>
+      )}
+
+      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
+        {/* Video Player Section */}
+        <div className="lg:col-span-3 space-y-6">
+          <Card>
+            <CardContent className="p-0">
+              <div
+                ref={playerContainerRef}
+                className={`bg-gray-900 relative ${isFullscreen ? 'w-screen h-screen flex items-center justify-center' : 'aspect-video rounded-t-lg'}`}
+              >
+                {videoUrlError ? (
+                  <div className="w-full h-full flex items-center justify-center bg-muted rounded-t-lg">
+                    <div className="text-center p-6">
+                      <p className="text-destructive font-medium mb-2">Video URL is invalid</p>
+                      <p className="text-muted-foreground text-sm">Please contact support to fix this video.</p>
+                    </div>
+                  </div>
+                ) : currentVideo && (
+                  <>
+                    <iframe 
+                      key={`video-${currentVideo.id}-${iframeKey}`}
+                      ref={iframeRef}
+                      className={`w-full h-full ${isFullscreen ? '' : 'rounded-t-lg'}`}
+                      allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture" 
+                      allowFullScreen 
+                      title={currentVideo.title}
+                      frameBorder="0"
+                    />
+                    <VideoWatermark />
+                    <div className="absolute top-2 right-2 flex gap-2">
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        className="opacity-70 hover:opacity-100"
+                        onClick={toggleFullscreen}
+                        title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+                      >
+                        {isFullscreen ? <Minimize className="w-4 h-4" /> : <Maximize className="w-4 h-4" />}
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        className="opacity-70 hover:opacity-100"
+                        onClick={() => setIframeKey(prev => prev + 1)}
+                        title="Reload video if not playing"
+                      >
+                        <RefreshCw className="w-4 h-4" />
+                      </Button>
+                    </div>
+                  </>
+                )}
+              </div>
+              <div className="p-6">
+                <h2 className="text-2xl font-bold mb-2">{currentVideo?.title}</h2>
+                <h3 className="font-semibold mb-2 text-base">Description</h3>
+                <p className="mb-4 text-black text-left text-sm">{currentVideo?.description}</p>
+
+                {attachments.length > 0 && <div className="mb-4">
+                    <h3 className="font-semibold mb-2 text-base">Attachments</h3>
+                    <ul className="list-disc list-inside space-y-1">
+                      {attachments.map(att => <li key={att.id}>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                let url = att.file_url || '';
+                                if (att.resource_id) {
+                                  const { data: res } = await supabase.from('resources').select('content').eq('id', att.resource_id).maybeSingle();
+                                  const path = (res as any)?.content?.storage_path;
+                                  if (path) url = await getResourceFileSignedUrl(path);
+                                }
+                                if (url) window.open(url, '_blank', 'noopener,noreferrer');
+                              } catch (e) {
+                                logger.error('Failed to open attachment', e);
+                              }
+                            }}
+                            className="text-primary underline"
+                          >
+                            {att.file_name}
+                          </button>
+                        </li>)}
+                    </ul>
+                  </div>}
+                
+                {attachmentLinks.length > 0 && <div className="mb-4">
+                    <h3 className="text-sm font-semibold mb-2">Links mentioned</h3>
+                    <ul className="list-disc list-inside space-y-1">
+                      {attachmentLinks.map((link, idx) => <li key={idx}>
+                          <a href={link} target="_blank" rel="noopener noreferrer" className="text-primary underline">
+                            {link}
+                          </a>
+                        </li>)}
+                    </ul>
+                  </div>}
+                
+
+                {/* Lecture Rating - Shows after video is marked complete */}
+                {showRating && currentVideo && (
+                  <>
+                    <div id="lecture-rating-anchor" className="mt-6 flex items-center gap-3 rounded-lg border border-orange-200 bg-orange-50 p-4">
+                      <Star className="w-5 h-5 text-orange-600 shrink-0" />
+                      <div className="flex-1 text-sm">
+                        <p className="font-medium text-orange-900">Please rate this lesson to unlock the next one</p>
+                        <p className="text-orange-700 text-xs">Your feedback helps us improve — earn +2 XP for rating.</p>
+                      </div>
+                    </div>
+                    <LectureRating recordingId={currentVideo.id} lessonTitle={currentVideo.title} />
+                  </>
+                )}
+
+                {(() => {
+                  const current = recordings.find(r => r.id === currentVideo?.id);
+                  const next = current
+                    ? recordings
+                        .filter(r => r.isUnlocked && (
+                          r.module_order > current.module_order ||
+                          (r.module_order === current.module_order && r.sequence_order > current.sequence_order)
+                        ))
+                        .sort((a, b) =>
+                          a.module_order === b.module_order
+                            ? a.sequence_order - b.sequence_order
+                            : a.module_order - b.module_order
+                        )[0]
+                    : null;
+                  return (
+                    <div className="mt-8 flex justify-center gap-3 flex-wrap">
+                      <Button size="sm" onClick={handleMarkComplete} disabled={videoWatched}>
+                        <CheckCircle className="w-4 h-4 mr-2" />
+                        {videoWatched ? 'Completed' : 'Mark Complete'}
+                      </Button>
+                      {videoWatched && next && (
+                        <Button
+                          size="sm"
+                          variant="default"
+                          onClick={() =>
+                            navigate(`/video-player?id=${next.id}&title=${encodeURIComponent(next.recording_title || '')}`)
+                          }
+                        >
+                          Next Lesson
+                          <ArrowRight className="w-4 h-4 ml-2" />
+                        </Button>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Sidebar */}
+        <div className="space-y-6">
+          {/* Success Partner Assistant - Hidden on mobile */}
+          <Card className="hidden sm:block bg-gradient-to-r from-blue-50 to-green-50 border-blue-200">
+            <CardHeader>
+              <CardTitle className="text-lg flex items-center">
+                <div className="w-8 h-8 bg-gradient-to-r from-blue-600 to-green-600 rounded-full mr-2 flex items-center justify-center">
+                  <MessageCircle className="w-4 h-4 text-white" />
+                </div>
+                Success Partner
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-muted-foreground mb-3">
+                I'm here to help! Ask me anything about this video or your learning journey.
+              </p>
+              <Button 
+                size="sm" 
+                className="w-full" 
+                onClick={() => setShowSuccessPartner(true)}
+                disabled={authLoading || !user?.id || !user?.email}
+              >
+                {authLoading ? 'Loading...' : 'Ask Partner'}
+              </Button>
+            </CardContent>
+          </Card>
+
+          {/* Module Progress - current module only */}
+          <CurrentModuleCard currentVideoId={currentVideo?.id} />
+
+        </div>
+      </div>
+
+      {showSuccessPartner && !authLoading && user?.id && user?.email && (
+        <SuccessPartner 
+          onClose={() => setShowSuccessPartner(false)}
+          user={{
+            id: user.id,
+            full_name: user.full_name || user.email.split('@')[0] || 'Student',
+            email: user.email
+          }}
+        />
+      )}
+    </div>;
+  };
+export default VideoPlayer;
