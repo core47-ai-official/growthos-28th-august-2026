@@ -15,6 +15,7 @@ import { logger } from '@/lib/logger';
 import { cn } from '@/lib/utils';
 
 const ACTIVITY_LOG_PAGE_SIZE = 500;
+const ADMIN_LOG_COLUMNS = 'id, entity_id, entity_type, action, description, created_at, data, performed_by';
 
 interface ActivityLog {
   id: string;
@@ -60,7 +61,36 @@ export function ActivityLogsDialog({ children, userId, userName }: ActivityLogsD
   }, [isOpen, dateRange, roleFilter, activityFilter]);
 
 
+  // Older / student-side activity only exists in user_activity_logs (the
+  // mirror into admin_logs was added later). Normalise those rows so they can
+  // be merged into the same list.
+  const normalizeActivityRow = (r: any) => ({
+    id: `ual_${r.id}`,
+    entity_id: r.reference_id || r.user_id,
+    entity_type: 'user',
+    action: r.activity_type,
+    description: String(r.activity_type || '').replace(/_/g, ' '),
+    created_at: r.occurred_at || r.created_at,
+    data: { ...(r.metadata || {}), target_user_id: r.user_id, reference_id: r.reference_id },
+    performed_by: r.user_id,
+  });
+
+  // Drop user_activity_logs rows that already exist as an admin_logs mirror
+  // (same user + action within the same second).
+  const dedupeRows = (rows: any[]) => {
+    const seen = new Set<string>();
+    const out: any[] = [];
+    for (const r of rows) {
+      const key = `${r.performed_by}|${r.action}|${new Date(r.created_at).toISOString().slice(0, 19)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(r);
+    }
+    return out;
+  };
+
   const fetchLogs = async ({ append = false }: { append?: boolean } = {}) => {
+
     if (!user) return;
 
     // Only superadmins, admins, and enrollment managers can access activity logs
@@ -93,26 +123,52 @@ export function ActivityLogsDialog({ children, userId, userName }: ActivityLogsD
         // Split into two indexed queries and merge — a single `.or()` with a
         // JSON path filter causes statement timeouts on large admin_logs
         // tables. JSON containment can use the admin_logs.data GIN index.
-        const [byPerformer, byTarget] = await Promise.all([
+        const activityQuery = (() => {
+          let q: any = supabase
+            .from('user_activity_logs')
+            .select('id, user_id, activity_type, metadata, reference_id, occurred_at')
+            .eq('user_id', userId);
+          if (dateRange !== 'all') {
+            const days = parseInt(dateRange.replace('days', ''));
+            const startDate = new Date();
+            startDate.setDate(startDate.getDate() - days);
+            q = q.gte('occurred_at', startDate.toISOString());
+          }
+          if (activityFilter !== 'all') q = q.eq('activity_type', activityFilter);
+          if (append && cursorCreatedAt) q = q.lt('occurred_at', cursorCreatedAt);
+          return q.order('occurred_at', { ascending: false }).limit(queryLimit);
+        })();
+
+        const [byPerformer, byTarget, byActivity] = await Promise.all([
           applyFilters(
-            supabase.from('admin_logs').select('*').eq('performed_by', userId)
+            supabase.from('admin_logs').select(ADMIN_LOG_COLUMNS).eq('performed_by', userId)
           ).order('created_at', { ascending: false }).limit(queryLimit),
           applyFilters(
-            supabase.from('admin_logs').select('*').contains('data', { target_user_id: userId })
+            supabase.from('admin_logs').select(ADMIN_LOG_COLUMNS).contains('data', { target_user_id: userId })
           ).order('created_at', { ascending: false }).limit(queryLimit),
+          activityQuery,
         ]);
-        if (byPerformer.error) throw byPerformer.error;
-        if (byTarget.error) throw byTarget.error;
+
+        // Keep the dialog useful if one legacy source is temporarily unavailable.
+        // Only fail when every source failed; otherwise render the rows we received.
+        const sourceErrors = [byPerformer.error, byTarget.error, byActivity.error].filter(Boolean);
+        if (sourceErrors.length === 3) throw sourceErrors[0];
+        sourceErrors.forEach(error => logger.error('Partial activity log source failure:', error));
         const merged = new Map<string, any>();
         [...(byPerformer.data || []), ...(byTarget.data || [])].forEach(row => {
           merged.set(row.id, row);
         });
-        data = Array.from(merged.values())
-          .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
-          .slice(0, queryLimit);
+        (byActivity.data || []).map(normalizeActivityRow).forEach((row: any) => {
+          if (row.created_at) merged.set(row.id, row);
+        });
+        data = dedupeRows(
+          Array.from(merged.values())
+            .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+        ).slice(0, queryLimit);
+
       } else {
         const { data: rows, error } = await applyFilters(
-          supabase.from('admin_logs').select('*')
+          supabase.from('admin_logs').select(ADMIN_LOG_COLUMNS)
         ).order('created_at', { ascending: false }).limit(queryLimit);
         if (error) throw error;
         data = rows || [];
@@ -273,19 +329,42 @@ export function ActivityLogsDialog({ children, userId, userName }: ActivityLogsD
       while (all.length < MAX_ROWS) {
         let rows: any[] = [];
         if (userId) {
-          const [byPerformer, byTarget] = await Promise.all([
-            applyFilters(supabase.from('admin_logs').select('*').eq('performed_by', userId), cursor),
-            applyFilters(supabase.from('admin_logs').select('*').contains('data', { target_user_id: userId }), cursor),
+          const activityQuery = (() => {
+            let q: any = supabase
+              .from('user_activity_logs')
+              .select('id, user_id, activity_type, metadata, reference_id, occurred_at')
+              .eq('user_id', userId);
+            if (dateRange !== 'all') {
+              const days = parseInt(dateRange.replace('days', ''));
+              const startDate = new Date();
+              startDate.setDate(startDate.getDate() - days);
+              q = q.gte('occurred_at', startDate.toISOString());
+            }
+            if (activityFilter !== 'all') q = q.eq('activity_type', activityFilter);
+            if (cursor) q = q.lt('occurred_at', cursor);
+            return q.order('occurred_at', { ascending: false }).limit(PAGE);
+          })();
+
+          const [byPerformer, byTarget, byActivity] = await Promise.all([
+            applyFilters(supabase.from('admin_logs').select(ADMIN_LOG_COLUMNS).eq('performed_by', userId), cursor),
+            applyFilters(supabase.from('admin_logs').select(ADMIN_LOG_COLUMNS).contains('data', { target_user_id: userId }), cursor),
+            activityQuery,
           ]);
-          if (byPerformer.error) throw byPerformer.error;
-          if (byTarget.error) throw byTarget.error;
+          const sourceErrors = [byPerformer.error, byTarget.error, byActivity.error].filter(Boolean);
+          if (sourceErrors.length === 3) throw sourceErrors[0];
+          sourceErrors.forEach(error => logger.error('Partial activity export source failure:', error));
           const merged = new Map<string, any>();
           [...(byPerformer.data || []), ...(byTarget.data || [])].forEach(r => merged.set(r.id, r));
-          rows = Array.from(merged.values())
-            .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
-            .slice(0, PAGE);
+          (byActivity.data || []).map(normalizeActivityRow).forEach((r: any) => {
+            if (r.created_at) merged.set(r.id, r);
+          });
+          rows = dedupeRows(
+            Array.from(merged.values())
+              .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+          ).slice(0, PAGE);
+
         } else {
-          const { data, error } = await applyFilters(supabase.from('admin_logs').select('*'), cursor);
+          const { data, error } = await applyFilters(supabase.from('admin_logs').select(ADMIN_LOG_COLUMNS), cursor);
           if (error) throw error;
           rows = data || [];
         }
