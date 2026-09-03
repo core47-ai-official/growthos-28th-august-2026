@@ -124,6 +124,8 @@ export function StudentDashboard() {
     id: string;
     title: string;
     start_time: string;
+    end_time?: string;
+    status: string;
     mentor_name: string;
     link?: string;
     description?: string;
@@ -541,16 +543,18 @@ export function StudentDashboard() {
       // Fetch upcoming live session for this student's batch/course
       const currentBatchId = fetchedBatchId;
       try {
-        // Show sessions that are upcoming OR currently live (until their end_time, fallback start+1hr)
+        // Show sessions that are upcoming OR currently live (until their end_time, fallback start+1hr).
+        // Cancelled sessions are intentionally included so students see the cancelled status.
         const nowDate = new Date();
+        const windowStart = new Date(nowDate.getTime() - 24 * 60 * 60 * 1000).toISOString();
         let sessionQuery = supabase
           .from('success_sessions')
           .select('id, title, start_time, end_time, mentor_name, link, description, status')
-          .in('status', ['upcoming', 'live'])
+          .gte('start_time', windowStart)
           .not('link', 'is', null)
           .neq('link', '')
           .order('start_time', { ascending: true })
-          .limit(5);
+          .limit(20);
 
         // Filter by batch if enrolled, otherwise by course
         if (currentBatchId) {
@@ -566,19 +570,26 @@ export function StudentDashboard() {
 
         const { data: sessionData } = await sessionQuery;
         if (sessionData && sessionData.length > 0) {
-          // Filter client-side: only show sessions that haven't ended yet
-          const validSessions = sessionData.filter((s: any) => {
+          // Filter client-side: only show sessions that haven't ended yet, but keep cancelled ones visible
+          const activeSessions = sessionData.filter((s: any) => {
+            if (s.status === 'cancelled') return true;
             const start = new Date(s.start_time);
             const end = s.end_time ? new Date(s.end_time) : new Date(start.getTime() + 60 * 60 * 1000);
             return nowDate < end; // still ongoing or upcoming
           });
-          // Prefer currently-live session, then next upcoming
-          const liveSession = validSessions.find((s: any) => {
+          // Prefer currently-live session, then next upcoming, then any visible cancelled session
+          const liveSession = activeSessions.find((s: any) => {
+            if (s.status === 'cancelled') return false;
             const start = new Date(s.start_time);
-            return start <= nowDate;
+            const end = s.end_time ? new Date(s.end_time) : new Date(start.getTime() + 60 * 60 * 1000);
+            return start <= nowDate && nowDate < end;
           });
-          const upcomingSes = validSessions.find((s: any) => new Date(s.start_time) > nowDate);
-          setUpcomingSession(liveSession || upcomingSes || null);
+          const upcomingSes = activeSessions.find((s: any) => {
+            if (s.status === 'cancelled') return false;
+            return new Date(s.start_time) > nowDate;
+          });
+          const cancelledSession = activeSessions.find((s: any) => s.status === 'cancelled');
+          setUpcomingSession(liveSession || upcomingSes || cancelledSession || null);
         } else {
           setUpcomingSession(null);
         }
@@ -677,25 +688,61 @@ export function StudentDashboard() {
 
       {/* Upcoming Live Session Banner */}
       {upcomingSession && (
-        <Card className="border-primary/30 bg-gradient-to-r from-violet-500/10 via-primary/5 to-background shadow-md animate-fade-in">
+        <Card className={`border-primary/30 shadow-md animate-fade-in ${
+          upcomingSession.status === 'cancelled'
+            ? 'bg-gradient-to-r from-muted/60 via-muted/40 to-background border-muted'
+            : 'bg-gradient-to-r from-violet-500/10 via-primary/5 to-background'
+        }`}>
           <CardContent className="p-4 sm:p-5">
             <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
               <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-full bg-violet-500/15 flex items-center justify-center flex-shrink-0">
-                  <Video className="w-5 h-5 text-violet-600" />
+                <div className={`w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0 ${
+                  upcomingSession.status === 'cancelled'
+                    ? 'bg-muted text-muted-foreground'
+                    : 'bg-violet-500/15 text-violet-600'
+                }`}>
+                  <Video className="w-5 h-5" />
                 </div>
                 <div className="min-w-0">
-                  <p className="text-xs font-medium text-violet-600 uppercase tracking-wide">
-                    {new Date(upcomingSession.start_time) <= new Date() ? '🔴 Live Now' : 'Upcoming Live Session'}
-                  </p>
-                  <h3 className="text-base sm:text-lg font-semibold truncate">{upcomingSession.title}</h3>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <p className={`text-xs font-medium uppercase tracking-wide ${
+                      upcomingSession.status === 'cancelled'
+                        ? 'text-muted-foreground'
+                        : 'text-violet-600'
+                    }`}>
+                      {upcomingSession.status === 'cancelled'
+                        ? 'Cancelled'
+                        : new Date(upcomingSession.start_time) <= new Date() && (!upcomingSession.end_time || new Date() < new Date(upcomingSession.end_time))
+                          ? '🔴 Live Now'
+                          : 'Upcoming Live Session'}
+                    </p>
+                    {upcomingSession.status === 'cancelled' && (
+                      <Badge variant="secondary" className="bg-red-100 text-red-800 border-red-200">
+                        Cancelled
+                      </Badge>
+                    )}
+                    {upcomingSession.status === 'live' && (
+                      <Badge variant="destructive">Live</Badge>
+                    )}
+                    {upcomingSession.status === 'upcoming' && (
+                      <Badge variant="default">Upcoming</Badge>
+                    )}
+                    {upcomingSession.status === 'completed' && (
+                      <Badge variant="secondary">Completed</Badge>
+                    )}
+                  </div>
+                  <h3 className={`text-base sm:text-lg font-semibold truncate ${
+                    upcomingSession.status === 'cancelled' ? 'line-through text-muted-foreground' : ''
+                  }`}>
+                    {upcomingSession.title}
+                  </h3>
                   <p className="text-sm text-muted-foreground">
                     {format(new Date(upcomingSession.start_time), 'EEEE, MMM dd · h:mm a')}
                     {upcomingSession.mentor_name && ` · Host: ${upcomingSession.mentor_name}`}
                   </p>
                 </div>
               </div>
-              {upcomingSession.link && (
+              {upcomingSession.link && upcomingSession.status !== 'cancelled' && (
                 <Button
                   size="sm"
                   className="bg-violet-600 hover:bg-violet-700 text-white flex-shrink-0"
@@ -704,6 +751,11 @@ export function StudentDashboard() {
                   <Video className="w-4 h-4 mr-1.5" />
                   Join Session
                 </Button>
+              )}
+              {upcomingSession.status === 'cancelled' && (
+                <Badge variant="outline" className="flex-shrink-0 text-muted-foreground border-muted">
+                  Session Cancelled
+                </Badge>
               )}
             </div>
           </CardContent>
